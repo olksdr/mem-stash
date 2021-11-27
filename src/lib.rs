@@ -103,7 +103,17 @@ impl CacheReader for CacheInner {
     fn read(&self, index: usize) -> Result<u64> {
         let mut buf: [u8; 8] = [0; 8];
 
-        // TODO: check if we access undefined indicies
+        if index > self.elements_count {
+            return Err(format!(
+                "Unable to access index = {} out of bounds, max available index = {}",
+                index, self.elements_count
+            )
+            .into());
+        }
+
+        // Safety:
+        // We are checking if the accessed index is still in the bound of the allocated file
+        // and return the error before hitting the `unsafe` code
         unsafe {
             self.memmap
                 .as_ptr()
