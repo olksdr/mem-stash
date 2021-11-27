@@ -1,0 +1,20 @@
+[package]
+name = "dense-cache"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+memmap2 = "0.5.0"
+
+[dev-dependencies]
+rayon = "1.5.1"
+tempfile = "3.2"
+rand = "0.8"
+
+[features]
+default = []
+
+# used for running benchmarks
+nightly = []
