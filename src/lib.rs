@@ -163,10 +163,12 @@ mod tests {
         });
     }
 
-    // helper function to generate the list of random number from 0..1000000
+    // helper function to generate the list of random number from 0..u64::MAX
     fn get_random_items(items: usize) -> Vec<usize> {
         let mut rng = rand::thread_rng();
-        (0..items).map(|_| rng.gen_range(0..1000000)).collect()
+        (0..items)
+            .map(|_| rng.gen_range(0..u64::MAX as usize))
+            .collect()
     }
 
     #[cfg(feature = "nightly")]
