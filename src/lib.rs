@@ -42,9 +42,9 @@ impl Cache {
         (index << 3) as usize
     }
 
-    fn with_reader<F>(&self, f: F) -> Result<u64>
+    pub fn with_reader<F>(&self, mut f: F) -> Result<()>
     where
-        F: Fn(&dyn CacheReader) -> Result<u64>,
+        F: FnMut(&dyn CacheReader) -> Result<()>,
     {
         let guard = self.inner.lock();
         let reader = guard.as_deref().map_err(|e| {
@@ -56,7 +56,7 @@ impl Cache {
         f(reader)
     }
 
-    fn with_writer<F>(&self, f: F) -> Result<()>
+    pub fn with_writer<F>(&self, f: F) -> Result<()>
     where
         F: Fn(&mut dyn CacheWriter) -> Result<()>,
     {
@@ -75,7 +75,12 @@ impl Cache {
     }
 
     pub fn read(&self, index: usize) -> Result<u64> {
-        self.with_reader(|reader| reader.read(index))
+        let mut result: Option<u64> = None;
+        self.with_reader(|reader| {
+            result = reader.read(index).ok();
+            Ok(())
+        })?;
+        result.ok_or_else(|| format!("Unable to find requested index = {}", index).into())
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -151,7 +156,7 @@ impl CacheWriter for CacheInner {
 mod tests {
 
     use crate::*;
-    use rand::Rng;
+    use rand::{prelude::SliceRandom, Rng};
     use rayon::prelude::*;
     use tempfile::tempdir;
 
@@ -165,13 +170,13 @@ mod tests {
         println!("[single] temp dir path: {:?}", dir.path());
         let cache = Cache::new(dir.path().join("single-thread.dat")).expect("Mmap allocation");
 
-        for (i, d) in data.iter().enumerate() {
-            cache.write(i, *d as u64).expect("Data is written to MMap");
+        for v in data.iter() {
+            cache.write(v.0, v.1).expect("Data is written to MMap");
         }
 
-        for (i, d) in data.iter().enumerate() {
-            let data_from_mmap: u64 = cache.read(i).expect("Data is read from MMap");
-            assert_eq!(data_from_mmap, *d as u64);
+        for v in data {
+            let data_from_mmap: u64 = cache.read(v.0).expect("Data is read from MMap");
+            assert_eq!(data_from_mmap, v.1);
         }
     }
 
@@ -183,21 +188,23 @@ mod tests {
         let cache = Cache::new(dir.path().join("multi-thread.dat")).expect("MMap allocation");
         let data = get_random_items(100000);
 
-        data.par_iter().enumerate().for_each(|(i, v)| {
-            cache.write(i, *v as u64).expect("Data is written to Mmap");
+        data.par_iter().for_each(|v| {
+            cache.write(v.0, v.1).expect("Data is written to Mmap");
         });
 
-        data.par_iter().enumerate().for_each(|(i, v)| {
-            assert_eq!(*v as u64, cache.read(i).expect("Data is read from MMap"))
-        });
+        data.par_iter()
+            .for_each(|v| assert_eq!(v.1, cache.read(v.0).expect("Data is read from MMap")));
     }
 
     // helper function to generate the list of random number from 0..u64::MAX
-    fn get_random_items(items: usize) -> Vec<usize> {
+    fn get_random_items(items: usize) -> Vec<(usize, u64)> {
         let mut rng = rand::thread_rng();
-        (0..items)
-            .map(|_| rng.gen_range(0..u64::MAX as usize))
-            .collect()
+        let mut col = (0..items)
+            .map(|_| rng.gen_range(0..u64::MAX))
+            .enumerate()
+            .collect::<Vec<_>>();
+        col.shuffle(&mut rng);
+        col
     }
 
     #[cfg(feature = "nightly")]
@@ -205,15 +212,15 @@ mod tests {
 
     #[cfg(feature = "nightly")]
     #[bench]
-    fn bench_writer(b: &mut Bencher) {
+    fn bench_write(b: &mut Bencher) {
         let dir = tempdir().unwrap();
         println!("[writer] temp dir path: {:?}", dir.path());
         let cache = Cache::new(dir.path().join("test-cache-write.dat")).unwrap();
-        let input_data: Vec<usize> = get_random_items(1000000);
+        let input_data = get_random_items(1000000);
 
         b.iter(|| {
-            input_data.par_iter().enumerate().for_each(|(i, v)| {
-                cache.write(i, *v as u64).unwrap();
+            input_data.par_iter().for_each(|v| {
+                cache.write(v.0, v.1).unwrap();
             });
         })
     }
@@ -224,16 +231,72 @@ mod tests {
         let dir = tempdir().unwrap();
         println!("[reader] temp dir path: {:?}", dir.path());
         let cache = Cache::new(dir.path().join("test-cache-read.dat")).unwrap();
-        let input_data: Vec<usize> = get_random_items(1000000);
+        let input_data = get_random_items(1000000);
 
-        input_data.par_iter().enumerate().for_each(|(i, v)| {
-            cache.write(i, *v as u64).unwrap();
+        input_data.par_iter().for_each(|v| {
+            cache.write(v.0, v.1).unwrap();
         });
         cache.flush().unwrap();
 
         b.iter(|| {
-            input_data.par_iter().enumerate().for_each(|(i, _)| {
-                let _ = cache.read(i).unwrap();
+            input_data.par_iter().for_each(|v| {
+                let _ = cache.read(v.0).unwrap();
+            });
+        })
+    }
+
+    #[cfg(feature = "nightly")]
+    #[bench]
+    fn bench_read_batch(b: &mut Bencher) {
+        let dir = tempdir().unwrap();
+        println!("[reader-batch] temp dir path: {:?}", dir.path());
+        let cache = Cache::new(dir.path().join("test-cache-read-batch.dat")).unwrap();
+        let input_data = get_random_items(1000000);
+
+        input_data.par_iter().for_each(|v| {
+            cache.write(v.0, v.1).unwrap();
+        });
+
+        b.iter(|| {
+            // partition our data into chunks with 1000 elements each
+            // and read them up from mmap file
+            input_data.par_chunks(1000).for_each(|chunk| {
+                cache
+                    .with_reader(|r| {
+                        for e in chunk {
+                            let _ = r.read(e.0).unwrap();
+                        }
+                        Ok(())
+                    })
+                    .unwrap(); // we must unwrap to make sure the function actually is executed
+            });
+        })
+    }
+
+    #[cfg(feature = "nightly")]
+    #[bench]
+    fn bench_write_batch(b: &mut Bencher) {
+        let dir = tempdir().unwrap();
+        println!("[write-batch] temp dir path: {:?}", dir.path());
+        let cache = Cache::new(dir.path().join("test-cache-write-batch.dat")).unwrap();
+        let input_data = get_random_items(1000000);
+
+        input_data.par_iter().for_each(|v| {
+            cache.write(v.0, v.1).unwrap();
+        });
+
+        b.iter(|| {
+            // partition our data into chunks with 1000 elements each
+            // and write them to the mmap file
+            input_data.par_chunks(1000).for_each(|chunk| {
+                cache
+                    .with_writer(|w| {
+                        for e in chunk {
+                            w.write(e.0, e.1).unwrap();
+                        }
+                        Ok(())
+                    })
+                    .unwrap(); // we must unwrap to make sure the function actually is executed
             });
         })
     }
