@@ -44,73 +44,42 @@ impl Cache {
 
     fn with_reader<F>(&self, f: F) -> Result<u64>
     where
-        F: Fn(&CacheInner) -> Result<u64>,
+        F: Fn(&dyn CacheReader) -> Result<u64>,
     {
-        f(self.inner.lock().as_ref().map_err(|e| {
+        let guard = self.inner.lock();
+        let reader = guard.as_deref().map_err(|e| {
             format!(
-                "Cannot get a shared referance to the mmap allocation: {:?}",
+                "Cannot get the shared reference to the mmap allocation: {:?}",
                 e
             )
-        })?)
+        })?;
+        f(reader)
     }
 
     fn with_writer<F>(&self, f: F) -> Result<()>
     where
-        F: Fn(&mut CacheInner) -> Result<()>,
+        F: Fn(&mut dyn CacheWriter) -> Result<()>,
     {
-        f(self.inner.lock().as_deref_mut().map_err(|e| {
+        let mut guard = self.inner.lock();
+        let writer = guard.as_deref_mut().map_err(|e| {
             format!(
                 "Cannot get a mutable reference to the mmap allocation: {:?}",
                 e
             )
-        })?)
+        })?;
+        f(writer)
     }
 
     pub fn write(&self, index: usize, value: u64) -> Result<()> {
-        self.with_writer(|inner| {
-            // Resize if trying to access non-existing index
-            loop {
-                if inner.elements_count < index {
-                    inner.memmap.flush()?;
-
-                    let file_size = inner.file.metadata()?.len();
-
-                    inner
-                        .file
-                        .set_len(file_size + (PAGE_SIZE * std::mem::size_of::<u64>()) as u64)?;
-                    inner.elements_count += PAGE_SIZE;
-
-                    let new_mmap = unsafe { memmap2::MmapOptions::new().map_mut(&inner.file)? };
-                    inner.memmap = new_mmap;
-                } else {
-                    break;
-                }
-            }
-
-            let ptr = inner.memmap.as_mut_ptr();
-            unsafe {
-                ptr.add(Self::get_location(index))
-                    .copy_from(value.to_le_bytes().as_mut_ptr(), std::mem::size_of::<u64>());
-            }
-
-            Ok(())
-        })
+        self.with_writer(|writer| writer.write(index, value))
     }
 
     pub fn read(&self, index: usize) -> Result<u64> {
-        self.with_reader(|inner| {
-            let mut buf: [u8; 8] = [0; 8];
+        self.with_reader(|reader| reader.read(index))
+    }
 
-            // TODO: check if we access undefined indicies
-            unsafe {
-                inner
-                    .memmap
-                    .as_ptr()
-                    .add(Self::get_location(index))
-                    .copy_to(buf.as_mut_ptr(), std::mem::size_of::<u64>())
-            };
-            Ok(u64::from_le_bytes(buf))
-        })
+    pub fn flsuh(&self) -> Result<()> {
+        self.with_writer(|writer| writer.flush())
     }
 }
 
@@ -119,6 +88,60 @@ pub struct CacheInner {
     file: File,
     elements_count: usize,
     memmap: memmap2::MmapMut,
+}
+
+pub trait CacheReader {
+    fn read(&self, index: usize) -> Result<u64>;
+}
+
+impl CacheReader for CacheInner {
+    fn read(&self, index: usize) -> Result<u64> {
+        let mut buf: [u8; 8] = [0; 8];
+
+        // TODO: check if we access undefined indicies
+        unsafe {
+            self.memmap
+                .as_ptr()
+                .add(Cache::get_location(index))
+                .copy_to(buf.as_mut_ptr(), std::mem::size_of::<u64>())
+        };
+        Ok(u64::from_le_bytes(buf))
+    }
+}
+
+pub trait CacheWriter {
+    fn write(&mut self, index: usize, value: u64) -> Result<()>;
+    fn flush(&mut self) -> Result<()>;
+}
+
+impl CacheWriter for CacheInner {
+    fn flush(&mut self) -> Result<()> {
+        self.memmap.flush()?;
+        Ok(())
+    }
+
+    fn write(&mut self, index: usize, value: u64) -> Result<()> {
+        if self.elements_count < index {
+            self.memmap.flush()?;
+            let file_size = self.file.metadata()?.len();
+            let new_size = (index - self.elements_count + PAGE_SIZE) * std::mem::size_of::<u64>()
+                + file_size as usize;
+            self.file.set_len(new_size as u64)?;
+            self.elements_count += index - self.elements_count + PAGE_SIZE;
+            let new_mmap = unsafe { memmap2::MmapOptions::new().map_mut(&self.file)? };
+            self.memmap = new_mmap;
+        }
+
+        let ptr = self.memmap.as_mut_ptr();
+        // Safety:
+        // file is big enough to write in the requested location
+        unsafe {
+            ptr.add(Cache::get_location(index))
+                .copy_from(value.to_le_bytes().as_mut_ptr(), std::mem::size_of::<u64>());
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +159,7 @@ mod tests {
 
         // set up our cache file
         let dir = tempdir().unwrap();
+        println!("[single] temp dir path: {:?}", dir.path());
         let cache = Cache::new(dir.path().join("single-thread.dat")).expect("Mmap allocation");
 
         for (i, d) in data.iter().enumerate() {
@@ -151,6 +175,8 @@ mod tests {
     #[test]
     fn multi_thread_access() {
         let dir = tempdir().unwrap();
+        println!("[multi] temp dir path: {:?}", dir.path());
+
         let cache = Cache::new(dir.path().join("multi-thread.dat")).expect("MMap allocation");
         let data = get_random_items(100000);
 
@@ -178,12 +204,13 @@ mod tests {
     #[bench]
     fn bench_writer(b: &mut Bencher) {
         let dir = tempdir().unwrap();
+        println!("[writer] temp dir path: {:?}", dir.path());
         let cache = Cache::new(dir.path().join("test-cache-write.dat")).unwrap();
-        let input_data: Vec<usize> = get_random_items(100000);
+        let input_data: Vec<usize> = get_random_items(1000000);
 
         b.iter(|| {
-            input_data.iter().par_bridge().for_each(|v| {
-                cache.write(*v, *v as u64).unwrap();
+            input_data.par_iter().enumerate().for_each(|(i, v)| {
+                cache.write(i, *v as u64).unwrap();
             });
         })
     }
@@ -192,16 +219,18 @@ mod tests {
     #[bench]
     fn bench_read(b: &mut Bencher) {
         let dir = tempdir().unwrap();
+        println!("[reader] temp dir path: {:?}", dir.path());
         let cache = Cache::new(dir.path().join("test-cache-read.dat")).unwrap();
-        let input_data: Vec<usize> = get_random_items(100000);
+        let input_data: Vec<usize> = get_random_items(1000000);
 
-        input_data.iter().par_bridge().for_each(|v| {
-            cache.write(*v, *v as u64).unwrap();
+        input_data.par_iter().enumerate().for_each(|(i, v)| {
+            cache.write(i, *v as u64).unwrap();
         });
+        cache.flsuh().unwrap();
 
         b.iter(|| {
-            input_data.iter().par_bridge().for_each(|v| {
-                let _ = cache.read(*v).unwrap();
+            input_data.par_iter().enumerate().for_each(|(i, _)| {
+                let _ = cache.read(i).unwrap();
             });
         })
     }
