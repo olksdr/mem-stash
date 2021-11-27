@@ -78,7 +78,7 @@ impl Cache {
         self.with_reader(|reader| reader.read(index))
     }
 
-    pub fn flsuh(&self) -> Result<()> {
+    pub fn flush(&self) -> Result<()> {
         self.with_writer(|writer| writer.flush())
     }
 }
@@ -128,6 +128,9 @@ impl CacheWriter for CacheInner {
                 + file_size as usize;
             self.file.set_len(new_size as u64)?;
             self.elements_count += index - self.elements_count + PAGE_SIZE;
+
+            // Safety:
+            // we just resized the file and are ok to create a new MMap from the file with new size
             let new_mmap = unsafe { memmap2::MmapOptions::new().map_mut(&self.file)? };
             self.memmap = new_mmap;
         }
@@ -226,7 +229,7 @@ mod tests {
         input_data.par_iter().enumerate().for_each(|(i, v)| {
             cache.write(i, *v as u64).unwrap();
         });
-        cache.flsuh().unwrap();
+        cache.flush().unwrap();
 
         b.iter(|| {
             input_data.par_iter().enumerate().for_each(|(i, _)| {
