@@ -1,7 +1,8 @@
 [package]
-name = "dense-cache"
+name = "mem-stash"
 version = "0.1.0"
 edition = "2021"
+authors = ["Oleksandr Kylymnychenko <oleksandr@nerdydev.net>"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -15,6 +16,5 @@ rand = "0.8"
 
 [features]
 default = []
-
 # used for running benchmarks
 nightly = []
