@@ -4,16 +4,29 @@ use std::sync::{Arc, Mutex};
 
 use memmap2;
 
-type Result<T, E = Box<dyn std::error::Error + Sync + Send>> = std::result::Result<T, E>;
+/// Wrapper over the [`std::result::Result`]
+pub type Result<T, E = Box<dyn std::error::Error + Sync + Send>> = std::result::Result<T, E>;
 
+// Just some initial size we use for our file-based mmap
+const PAGE_SIZE: usize = 65536;
+
+/// Cache provides the useful functionality to efficiently store `u64`s into the file-based mmap allocation
+/// and retrieve those from. It's thread safe and can be used for async access.
+/// Data internal data is protected by [`std::sync::Mutex`]
 #[derive(Debug, Clone)]
 pub struct Cache {
     inner: Arc<Mutex<CacheInner>>,
 }
 
-const PAGE_SIZE: usize = 8096;
-
 impl Cache {
+    /// Returns the [`Cache`] instance where all the data will be stored.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mem_stash::Cache;
+    /// let cache = Cache::new("cache-file.dat".into()).unwrap();
+    /// ```
     pub fn new(path: PathBuf) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -33,10 +46,45 @@ impl Cache {
         }));
         Ok(Self { inner })
     }
+
+    /// Returns the index of the beginning of the data in the mmap alocatated space
     fn get_location(index: usize) -> usize {
         (index << 3) as usize
     }
 
+    /// Accepts the function which is executed in the context of the reader.
+    /// Caller must keep in mind that lock will be held on the data for the time of function
+    /// execution.
+    ///
+    ///
+    /// Try to keep the run time as short as possible
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mem_stash::Cache;
+    /// let cache = Cache::new("cache-file.dat".into()).unwrap();
+    /// let data = vec![1u64, 2, 3, 4];
+    ///
+    /// # cache
+    /// #     .with_writer(|w| {
+    /// #         for (i, e) in data.iter().enumerate() {
+    /// #             w.write(i, *e).unwrap();
+    /// #         }
+    /// #         Ok(())
+    /// #     })
+    /// #     .unwrap();
+    ///
+    /// cache
+    ///     .with_reader(|r| {
+    ///         for (i, e) in data.iter().enumerate() {
+    ///             let result = r.read(i).unwrap(); // must check the result of the writing into the cache
+    ///             assert_eq!(result, *e)
+    ///         }
+    ///         Ok(())
+    ///     })
+    ///     .unwrap(); // must consume the result of the operation
+    /// ```
     pub fn with_reader<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut(&dyn CacheReader) -> Result<()>,
@@ -51,6 +99,24 @@ impl Cache {
         f(reader)
     }
 
+    /// Accepts the function which is executed into the context of the writer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mem_stash::Cache;
+    /// let cache = Cache::new("cache-file.dat".into()).unwrap();
+    /// let data = vec![1u64, 2, 3, 4];
+    ///
+    /// cache
+    ///     .with_writer(|w| {
+    ///         for (i, e) in data.iter().enumerate() {
+    ///             w.write(i, *e).unwrap(); // must check the result of the writing into the cache
+    ///         }
+    ///         Ok(())
+    ///     })
+    ///     .unwrap(); // must consume the result of the operation
+    /// ```
     pub fn with_writer<F>(&self, f: F) -> Result<()>
     where
         F: Fn(&mut dyn CacheWriter) -> Result<()>,
@@ -65,10 +131,37 @@ impl Cache {
         f(writer)
     }
 
+    /// Writes the single element into the cache on the provided index
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use mem_stash::Cache;
+    /// # let cache = Cache::new("cache-file.dat".into()).unwrap();
+    ///
+    /// cache.write(1, 234u64).unwrap();
+    ///
+    /// ```
     pub fn write(&self, index: usize, value: u64) -> Result<()> {
         self.with_writer(|writer| writer.write(index, value))
     }
 
+    /// Returns the element read from the requested index.
+    ///
+    /// If the provided `index` is out of bound of the allocated file error will be returned
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use mem_stash::Cache;
+    /// # let cache = Cache::new("cache-file.dat".into()).unwrap();
+    ///
+    /// cache.write(1, 42).unwrap();
+    /// let result = cache.read(1).unwrap();
+    ///
+    /// assert_eq!(result, 42);
+    ///
+    /// ```
     pub fn read(&self, index: usize) -> Result<u64> {
         let mut result: Option<u64> = None;
         self.with_reader(|reader| {
@@ -78,6 +171,7 @@ impl Cache {
         result.ok_or_else(|| format!("Unable to find requested index = {}", index).into())
     }
 
+    /// Flushes the data to the file which backes the mmap allocation
     pub fn flush(&self) -> Result<()> {
         self.with_writer(|writer| writer.flush())
     }
@@ -90,14 +184,14 @@ struct CacheInner {
     memmap: memmap2::MmapMut,
 }
 
+/// Provides the implementation of the reader context
 pub trait CacheReader {
+    /// Returns the element from the requested index
     fn read(&self, index: usize) -> Result<u64>;
 }
 
 impl CacheReader for CacheInner {
     fn read(&self, index: usize) -> Result<u64> {
-        let mut buf: [u8; 8] = [0; 8];
-
         if index > self.elements_count {
             return Err(format!(
                 "Unable to access index = {} out of bounds, max available index = {}",
@@ -106,6 +200,7 @@ impl CacheReader for CacheInner {
             .into());
         }
 
+        let mut buf = [0u8; std::mem::size_of::<u64>()];
         // Safety:
         // We are checking if the accessed index is still in the bound of the allocated file
         // and return the error before hitting the `unsafe` code
@@ -119,8 +214,14 @@ impl CacheReader for CacheInner {
     }
 }
 
+/// Provides the implementation of the writer context
 pub trait CacheWriter {
+    /// Writes the data to the mmap on the requested index.
+    /// If the index bigger than current allocation, the mmap will be grown together with file on
+    /// which it relies
     fn write(&mut self, index: usize, value: u64) -> Result<()>;
+
+    /// Flushes the data to the file
     fn flush(&mut self) -> Result<()>;
 }
 
@@ -166,6 +267,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    // Single thread , but we still getting lock on each write and read operation
     fn single_threaded() {
         // data to write into the cache
         let data = get_random_items(100000);
@@ -186,6 +288,8 @@ mod tests {
     }
 
     #[test]
+    // Simulate many threads which try to write to and then read the data from the cache. We lock
+    // the data for each single write and read operation
     fn multi_thread_access() {
         let dir = tempdir().unwrap();
         println!("[multi] temp dir path: {:?}", dir.path());
@@ -217,6 +321,7 @@ mod tests {
 
     #[cfg(feature = "nightly")]
     #[bench]
+    // run the bench on write and lock is taken for each operation
     fn bench_write(b: &mut Bencher) {
         let dir = tempdir().unwrap();
         println!("[writer] temp dir path: {:?}", dir.path());
@@ -232,6 +337,7 @@ mod tests {
 
     #[cfg(feature = "nightly")]
     #[bench]
+    // run the bench on read and lock is taken for each operation
     fn bench_read(b: &mut Bencher) {
         let dir = tempdir().unwrap();
         println!("[reader] temp dir path: {:?}", dir.path());
@@ -252,6 +358,8 @@ mod tests {
 
     #[cfg(feature = "nightly")]
     #[bench]
+    // run the bench on read and we try to partition the data into chunks of 1000 elements, which
+    // are read from the cache while the lock on the data is held
     fn bench_read_batch(b: &mut Bencher) {
         let dir = tempdir().unwrap();
         println!("[reader-batch] temp dir path: {:?}", dir.path());
@@ -280,6 +388,8 @@ mod tests {
 
     #[cfg(feature = "nightly")]
     #[bench]
+    // run the bench on write and we try to partition the data into chunks of 1000 elements, which
+    // are written in batches to the cache while the lock is held
     fn bench_write_batch(b: &mut Bencher) {
         let dir = tempdir().unwrap();
         println!("[write-batch] temp dir path: {:?}", dir.path());
