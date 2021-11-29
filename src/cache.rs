@@ -344,10 +344,14 @@ mod tests {
         let cache = Cache::new(dir.path().join("test-cache-read.dat")).unwrap();
         let input_data = get_random_items(1000000);
 
-        input_data.par_iter().for_each(|v| {
-            cache.write(v.0, v.1).unwrap();
-        });
-        cache.flush().unwrap();
+        cache
+            .with_writer(|w| {
+                for e in input_data.iter() {
+                    w.write(e.0, e.1).unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
 
         b.iter(|| {
             input_data.par_iter().for_each(|v| {
@@ -366,9 +370,14 @@ mod tests {
         let cache = Cache::new(dir.path().join("test-cache-read-batch.dat")).unwrap();
         let input_data = get_random_items(1000000);
 
-        input_data.par_iter().for_each(|v| {
-            cache.write(v.0, v.1).unwrap();
-        });
+        cache
+            .with_writer(|w| {
+                for e in input_data.iter() {
+                    w.write(e.0, e.1).unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
 
         b.iter(|| {
             // partition our data into chunks with 1000 elements each
@@ -395,10 +404,6 @@ mod tests {
         println!("[write-batch] temp dir path: {:?}", dir.path());
         let cache = Cache::new(dir.path().join("test-cache-write-batch.dat")).unwrap();
         let input_data = get_random_items(1000000);
-
-        input_data.par_iter().for_each(|v| {
-            cache.write(v.0, v.1).unwrap();
-        });
 
         b.iter(|| {
             // partition our data into chunks with 1000 elements each
